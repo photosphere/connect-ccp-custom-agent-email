@@ -1,13 +1,8 @@
 # Amazon Connect Email Handler
 
-一个用于处理 Amazon Connect **邮件（EMAIL）** 联系的页面。参考自
-[connect-ccp-custom-agent-chat](https://github.com/photosphere/connect-ccp-custom-agent-chat)，
-顶部登录与座席状态区域保持一致，中间原来的聊天框替换为**排队邮件列表**。
-
 ## 功能
 
-1. **顶部登录与状态**：使用 `amazon-connect-streams` 初始化 CCP，顶部的登录、退出、
-   座席姓名与状态下拉框与参考页面保持一致。
+1. **顶部登录与状态**：使用 `amazon-connect-streams` 初始化 CCP。
 2. **排队邮件列表**：调用
    [SearchContacts](https://docs.aws.amazon.com/connect/latest/APIReference/API_SearchContacts.html)
    查询配置文件中所配置队列里正在排队的邮件，并以列表形式显示明细。
@@ -118,14 +113,8 @@ npm start
 
 ## 使用说明
 
-- **登录**：点击“登录”弹出 Amazon Connect 登录窗口，登录成功后顶部显示座席姓名与状态。
 - **排队邮件**：列表显示配置队列中仍在排队（未分配座席、未断开）的 EMAIL 联系明细，
   包含主题、渠道、队列、入队时间、等待时长与 Contact ID。
 - **Assign to Me**：点击后将该邮件通过 `TransferContact` 转接到当前座席的个人队列。
   完成后列表会自动刷新。
 
-## 备注
-
-- `TransferContact` 仅支持 `TASK` 与 `EMAIL` 类型联系，且只能对活动中的联系调用。
-- 若“Assign to Me”提示无法确定 UserId，请确认登录座席的用户名在实例中存在，
-  并且凭证具备 `connect:ListUsers` 权限。
