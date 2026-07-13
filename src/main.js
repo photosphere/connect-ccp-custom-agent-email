@@ -16,6 +16,9 @@ const loginURL = "";
 // ============================================================
 let currentAgentUsername = null;
 let autoRefreshTimer = null;
+// 可选队列列表（{id, name}）与当前选中的队列ID集合
+let availableQueues = [];
+let selectedQueueIds = new Set();
 
 function $(id) {
   return document.getElementById(id);
@@ -249,7 +252,21 @@ function renderEmails(emails) {
 
 async function loadEmails() {
   try {
-    const resp = await fetch("/api/emails", { cache: "no-store" });
+    // 已加载队列但一个都没选：直接展示空列表，不发请求
+    if (availableQueues.length > 0 && selectedQueueIds.size === 0) {
+      renderEmails([]);
+      return;
+    }
+    // 若选择了部分队列，则作为查询参数传给后端进行筛选；全选时查询全部
+    let url = "/api/emails";
+    if (
+      selectedQueueIds.size > 0 &&
+      selectedQueueIds.size < availableQueues.length
+    ) {
+      const ids = [...selectedQueueIds].map(encodeURIComponent).join(",");
+      url += "?queueIds=" + ids;
+    }
+    const resp = await fetch(url, { cache: "no-store" });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "请求失败");
     renderEmails(data.emails || []);
@@ -482,6 +499,115 @@ $("autoRefresh").addEventListener("change", (e) => {
   if (e.target.checked) startAutoRefresh();
   else stopAutoRefresh();
 });
+
+// ============================================================
+// 队列多选下拉筛选
+// ============================================================
+/** 更新下拉按钮上的文字，反映当前选中情况 */
+function updateQueueFilterLabel() {
+  const label = $("queueFilterLabel");
+  const total = availableQueues.length;
+  const n = selectedQueueIds.size;
+  if (total === 0) {
+    label.textContent = "队列: 无";
+  } else if (n === 0 || n === total) {
+    label.textContent = "队列: 全部";
+  } else if (n === 1) {
+    const id = [...selectedQueueIds][0];
+    const q = availableQueues.find((x) => x.id === id);
+    label.textContent = "队列: " + (q ? q.name : id);
+  } else {
+    label.textContent = "队列: 已选 " + n + " 个";
+  }
+}
+
+/** 渲染下拉里的队列复选框列表 */
+function renderQueueFilterList() {
+  const list = $("queueFilterList");
+  list.innerHTML = "";
+  if (availableQueues.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "px-1 py-2 text-xs text-gray-400";
+    empty.textContent = "没有可用的队列。";
+    list.appendChild(empty);
+    return;
+  }
+  availableQueues.forEach((q) => {
+    const label = document.createElement("label");
+    label.className =
+      "flex items-center gap-2 px-1 py-1 text-sm text-gray-700 rounded hover:bg-gray-50 cursor-pointer";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "rounded";
+    cb.value = q.id;
+    cb.checked = selectedQueueIds.has(q.id);
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedQueueIds.add(q.id);
+      else selectedQueueIds.delete(q.id);
+      updateQueueFilterLabel();
+      loadEmails();
+    });
+    const span = document.createElement("span");
+    span.className = "break-all";
+    span.textContent = q.name;
+    label.appendChild(cb);
+    label.appendChild(span);
+    list.appendChild(label);
+  });
+}
+
+/** 从后端拉取可选队列并初始化选中状态（默认全选） */
+async function loadQueues() {
+  try {
+    const resp = await fetch("/api/queues", { cache: "no-store" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "请求失败");
+    availableQueues = data.queues || [];
+    // 默认全选（即查询全部）
+    selectedQueueIds = new Set(availableQueues.map((q) => q.id));
+    renderQueueFilterList();
+    updateQueueFilterLabel();
+  } catch (err) {
+    logOutput("加载队列列表失败: " + err.message);
+    const list = $("queueFilterList");
+    list.innerHTML =
+      '<div class="px-1 py-2 text-xs text-red-500">加载失败: ' +
+      escapeText(err.message) +
+      "</div>";
+  }
+}
+
+(function initQueueFilter() {
+  const btn = $("queueFilterBtn");
+  const menu = $("queueFilterMenu");
+  const wrap = $("queueFilter");
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    menu.classList.toggle("hidden");
+  });
+
+  // 点击菜单外部时关闭
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) menu.classList.add("hidden");
+  });
+
+  $("queueSelectAll").addEventListener("click", () => {
+    selectedQueueIds = new Set(availableQueues.map((q) => q.id));
+    renderQueueFilterList();
+    updateQueueFilterLabel();
+    loadEmails();
+  });
+
+  $("queueClearAll").addEventListener("click", () => {
+    selectedQueueIds.clear();
+    renderQueueFilterList();
+    updateQueueFilterLabel();
+    loadEmails();
+  });
+
+  loadQueues();
+})();
 
 // ============================================================
 // 暴露给 HTML 内联事件（onclick）使用
