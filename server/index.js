@@ -104,7 +104,26 @@ app.use("/api", (req, res, next) => {
 });
 
 // ============================================================
+// 返回可供筛选的队列列表（配置的监控队列 + 名称）
+// ============================================================
+app.get("/api/queues", async (req, res) => {
+  try {
+    const ids = connectCfg.queueIds || [];
+    await Promise.all(ids.map(resolveQueueName));
+    const queues = ids.map((id) => ({
+      id,
+      name: queueNameCache.get(id) || id,
+    }));
+    res.json({ queues });
+  } catch (err) {
+    console.error("获取队列列表失败:", err);
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// ============================================================
 // 查询在配置队列中排队的邮件（SearchContacts）
+// 支持通过 ?queueIds=a,b,c 只查询指定队列（须为已配置的监控队列子集）
 // ============================================================
 app.get("/api/emails", async (req, res) => {
   try {
@@ -117,8 +136,21 @@ app.get("/api/emails", async (req, res) => {
     const searchCriteria = {
       Channels: ["EMAIL"],
     };
-    if (connectCfg.queueIds && connectCfg.queueIds.length > 0) {
-      searchCriteria.QueueIds = connectCfg.queueIds;
+    // 前端传入的筛选队列（逗号分隔）；只保留配置中允许的队列
+    const requestedQueueIds = (req.query.queueIds || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const allowed = connectCfg.queueIds || [];
+    let effectiveQueueIds = allowed;
+    if (requestedQueueIds.length > 0) {
+      effectiveQueueIds =
+        allowed.length > 0
+          ? requestedQueueIds.filter((id) => allowed.includes(id))
+          : requestedQueueIds;
+    }
+    if (effectiveQueueIds && effectiveQueueIds.length > 0) {
+      searchCriteria.QueueIds = effectiveQueueIds;
     }
 
     const contacts = [];
