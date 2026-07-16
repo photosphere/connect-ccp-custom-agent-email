@@ -32,7 +32,7 @@
 ├── server/
 │   └── index.js          # Node.js/Express 后端，代理调用 Connect API
 ├── .env                  # 实际配置（含 AWS 凭证，已加入 .gitignore）
-├── .env.example          # 配置模板
+├── env.example           # 配置模板
 ├── vite.config.js        # Vite 配置（dev 端口 8080，/api 代理到 3001）
 └── package.json
 ```
@@ -42,7 +42,7 @@
 复制模板并填写：
 
 ```bash
-cp .env.example .env
+cp env.example .env
 ```
 
 `.env` 环境变量说明：
