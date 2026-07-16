@@ -19,6 +19,9 @@ let autoRefreshTimer = null;
 // 可选队列列表（{id, name}）与当前选中的队列ID集合
 let availableQueues = [];
 let selectedQueueIds = new Set();
+// 历史邮件分页状态
+let historyPage = 1;
+let historyTotalPages = 1;
 
 function $(id) {
   return document.getElementById(id);
@@ -77,6 +80,14 @@ function formatDuration(ms) {
   const s = total % 60;
   const pad = (n) => String(n).padStart(2, "0");
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
+/** Date -> datetime-local 输入框需要的本地时间字符串（YYYY-MM-DDTHH:mm） */
+function toDatetimeLocalValue(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+    d.getDate()
+  )}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 // ============================================================
@@ -146,7 +157,7 @@ function removeNonDataRows(tbody) {
 function showMessageRow(tbody, message, colorClass) {
   const tr = document.createElement("tr");
   const td = document.createElement("td");
-  td.setAttribute("colspan", "7");
+  td.setAttribute("colspan", "6");
   td.className = "px-3 py-6 text-center " + colorClass;
   td.textContent = message;
   tr.appendChild(td);
@@ -160,18 +171,22 @@ function createEmailRow(email) {
   tr.className = "hover:bg-gray-50 border-b border-gray-100";
 
   const classes = [
+    "px-3 py-2 text-blue-600 break-all text-xs underline cursor-pointer",
     "px-3 py-2 font-medium text-gray-800",
     "px-3 py-2 text-gray-600",
-    "px-3 py-2 text-gray-600 break-all",
     "px-3 py-2 text-gray-600",
     "px-3 py-2 text-gray-600",
-    "px-3 py-2 text-gray-500 break-all text-xs",
   ];
   classes.forEach((cls) => {
     const td = document.createElement("td");
     td.className = cls;
     tr.appendChild(td);
   });
+
+  // Contact ID 列（第一列）可点击，等同于点击 View
+  const idCell = tr.children[0];
+  idCell.title = "点击查看邮件历史回复";
+  idCell.addEventListener("click", () => viewHistory(email.id, email.name));
 
   const tdAction = document.createElement("td");
   tdAction.className = "px-3 py-2";
@@ -187,7 +202,7 @@ function createEmailRow(email) {
   const btn = document.createElement("button");
   btn.className =
     "assign-btn px-3 py-1 text-xs bg-green-500 hover:bg-green-600 text-white rounded-lg font-medium transition";
-  btn.textContent = "Assign to Me";
+  btn.textContent = "Reply";
   btn.addEventListener("click", () => assignToMe(email.id, btn));
 
   actionWrap.appendChild(viewBtn);
@@ -203,12 +218,11 @@ function updateEmailRow(row, email, now) {
   const enq = email.enqueueTimestamp || email.initiationTimestamp;
   const waiting = enq ? formatDuration(now - new Date(enq)) : "-";
   const cells = row.children;
-  setText(cells[0], email.name);
-  setText(cells[1], email.channel);
+  setText(cells[0], email.id);
+  setText(cells[1], email.name);
   setText(cells[2], email.queueName || email.queueId || "-");
   setText(cells[3], convertToLocalTime(enq));
   setText(cells[4], waiting);
-  setText(cells[5], email.id);
 }
 
 /** 增量渲染邮件列表 */
@@ -312,10 +326,48 @@ async function assignToMe(contactId, btn) {
     btn.classList.add("bg-gray-400");
     setTimeout(loadEmails, 1500);
   } catch (err) {
-    logOutput("Assign to Me 失败: " + err.message);
+    logOutput("Reply 失败: " + err.message);
     alert("分配失败: " + err.message);
     btn.disabled = false;
-    btn.textContent = "Assign to Me";
+    btn.textContent = "Reply";
+  }
+}
+
+// ============================================================
+// Reply（历史邮件）：为已完成邮件创建座席回复草稿并路由给当前座席
+// 与“排队中的邮件”的 assignToMe 不同：已完成联系不能转接，需 CreateContact
+// ============================================================
+async function replyToEmail(contactId, btn) {
+  if (!currentAgentUsername) {
+    alert("无法获取当前座席信息，请等待 CCP 登录完成。");
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "处理中...";
+  try {
+    const resp = await fetch("/api/reply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contactId: contactId,
+        username: currentAgentUsername,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.success) {
+      throw new Error(data.error || "回复失败");
+    }
+    logOutput(
+      "已创建座席回复: 原邮件 " + contactId + " -> 新联系 " + data.contactId
+    );
+    btn.textContent = "已回复";
+    btn.classList.remove("bg-green-500", "hover:bg-green-600");
+    btn.classList.add("bg-gray-400");
+  } catch (err) {
+    logOutput("Reply 失败: " + err.message);
+    alert("回复失败: " + err.message);
+    btn.disabled = false;
+    btn.textContent = "Reply";
   }
 }
 
@@ -482,6 +534,171 @@ function closeHistory() {
 })();
 
 // ============================================================
+// 标签页切换（排队中的邮件 / 历史邮件）
+// ============================================================
+const TAB_ACTIVE = ["bg-white", "text-blue-600", "border-gray-200"];
+const TAB_INACTIVE = ["text-gray-500", "hover:text-gray-700"];
+
+function switchTab(tab) {
+  const isQueue = tab === "queue";
+  const queueView = $("queueView");
+  const historyView = $("historyEmailView");
+  const tabQueue = $("tabQueue");
+  const tabHistory = $("tabHistory");
+
+  queueView.classList.toggle("hidden", !isQueue);
+  queueView.classList.toggle("flex", isQueue);
+  historyView.classList.toggle("hidden", isQueue);
+  historyView.classList.toggle("flex", !isQueue);
+
+  const active = isQueue ? tabQueue : tabHistory;
+  const inactive = isQueue ? tabHistory : tabQueue;
+  active.classList.add(...TAB_ACTIVE);
+  active.classList.remove(...TAB_INACTIVE);
+  inactive.classList.remove(...TAB_ACTIVE);
+  inactive.classList.add(...TAB_INACTIVE);
+
+  // 切换标签时收起底部的邮件历史详情面板
+  closeHistory();
+
+  // 首次进入历史邮件视图时自动加载一次
+  if (!isQueue && !historyView.dataset.loaded) {
+    historyView.dataset.loaded = "1";
+    loadHistoryEmails(1);
+  }
+}
+
+// ============================================================
+// 历史邮件列表（SearchContacts: EMAIL / AGENT_REPLY / COMPLETED）
+// ============================================================
+function renderHistoryEmails(data) {
+  const tbody = $("historyEmailList");
+  const emails = data.emails || [];
+  tbody.innerHTML = "";
+
+  $("historyEmailCount").textContent = data.total || 0;
+  historyPage = data.page || 1;
+  historyTotalPages = data.totalPages || 1;
+  $("histPageInfo").textContent =
+    "共 " + (data.total || 0) + " 条 · 第 " + historyPage + "/" + historyTotalPages + " 页";
+  $("histPrevBtn").disabled = historyPage <= 1;
+  $("histNextBtn").disabled = historyPage >= historyTotalPages;
+
+  if (emails.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.setAttribute("colspan", "6");
+    td.className = "px-3 py-6 text-center text-gray-400";
+    td.textContent = "该时间范围内没有历史邮件。";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+
+  emails.forEach((email) => {
+    const tr = document.createElement("tr");
+    tr.className = "hover:bg-gray-50 border-b border-gray-100";
+
+    // Contact ID（可点击，等同 View）
+    const idTd = document.createElement("td");
+    idTd.className =
+      "px-3 py-2 text-blue-600 break-all text-xs underline cursor-pointer";
+    idTd.textContent = email.id;
+    idTd.title = "点击查看邮件历史回复";
+    idTd.addEventListener("click", () => viewHistory(email.id, email.name));
+    tr.appendChild(idTd);
+
+    const cells = [
+      { text: convertToLocalTime(email.initiationTimestamp), cls: "px-3 py-2 text-gray-600" },
+      { text: email.systemEmail || "-", cls: "px-3 py-2 text-gray-600" },
+      { text: email.customerEmail || "-", cls: "px-3 py-2 text-gray-600" },
+      { text: email.agent || "-", cls: "px-3 py-2 text-gray-600" },
+    ];
+    cells.forEach((c) => {
+      const td = document.createElement("td");
+      td.className = c.cls;
+      td.textContent = c.text;
+      tr.appendChild(td);
+    });
+
+    // 操作列：View + Reply（与“排队中的邮件”一致）
+    const tdAction = document.createElement("td");
+    tdAction.className = "px-3 py-2";
+    const actionWrap = document.createElement("div");
+    actionWrap.className = "flex gap-2";
+
+    const viewBtn = document.createElement("button");
+    viewBtn.className =
+      "px-3 py-1 text-xs bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition";
+    viewBtn.textContent = "View";
+    viewBtn.addEventListener("click", () => viewHistory(email.id, email.name));
+
+    const replyBtn = document.createElement("button");
+    replyBtn.className =
+      "assign-btn px-3 py-1 text-xs bg-green-500 hover:bg-green-600 text-white rounded-lg font-medium transition";
+    replyBtn.textContent = "Reply";
+    replyBtn.addEventListener("click", () => replyToEmail(email.id, replyBtn));
+
+    actionWrap.appendChild(viewBtn);
+    actionWrap.appendChild(replyBtn);
+    tdAction.appendChild(actionWrap);
+    tr.appendChild(tdAction);
+
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadHistoryEmails(page) {
+  if (typeof page === "number") historyPage = page;
+  const tbody = $("historyEmailList");
+  tbody.innerHTML =
+    '<tr><td colspan="6" class="px-3 py-6 text-center text-gray-400">加载中...</td></tr>';
+
+  const startVal = $("histStart").value;
+  const endVal = $("histEnd").value;
+  const pageSize = $("histPageSize").value || "25";
+
+  const params = new URLSearchParams();
+  // datetime-local 是本地时间，转成 ISO 传给后端
+  if (startVal) params.set("startTime", new Date(startVal).toISOString());
+  if (endVal) params.set("endTime", new Date(endVal).toISOString());
+  params.set("page", String(historyPage));
+  params.set("pageSize", pageSize);
+
+  try {
+    const resp = await fetch("/api/history-emails?" + params.toString(), {
+      cache: "no-store",
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "请求失败");
+    renderHistoryEmails(data);
+  } catch (err) {
+    logOutput("加载历史邮件失败: " + err.message);
+    tbody.innerHTML =
+      '<tr><td colspan="6" class="px-3 py-6 text-center text-red-500">加载失败: ' +
+      escapeText(err.message) +
+      "</td></tr>";
+  }
+}
+
+function historyPrevPage() {
+  if (historyPage > 1) loadHistoryEmails(historyPage - 1);
+}
+function historyNextPage() {
+  if (historyPage < historyTotalPages) loadHistoryEmails(historyPage + 1);
+}
+
+/** 初始化历史邮件时间范围（默认过去 7 天）与每页大小联动 */
+(function initHistoryEmailControls() {
+  const now = new Date();
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  $("histEnd").value = toDatetimeLocalValue(now);
+  $("histStart").value = toDatetimeLocalValue(weekAgo);
+  // 改变每页大小时回到第 1 页重新查询
+  $("histPageSize").addEventListener("change", () => loadHistoryEmails(1));
+})();
+
+// ============================================================
 // 自动刷新
 // ============================================================
 function startAutoRefresh() {
@@ -617,7 +834,14 @@ Object.assign(window, {
   clearOutput,
   loadEmails,
   closeHistory,
+  switchTab,
+  loadHistoryEmails,
+  historyPrevPage,
+  historyNextPage,
 });
+
+// 默认激活“排队中的邮件”标签
+switchTab("queue");
 
 // 页面加载即自动初始化 CCP（无需登录按钮）
 initCcp();
