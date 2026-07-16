@@ -6,12 +6,14 @@ import {
   ConnectClient,
   SearchContactsCommand,
   TransferContactCommand,
+  CreateContactCommand,
   ListUsersCommand,
   DescribeQueueCommand,
   ListAssociatedContactsCommand,
   ListContactReferencesCommand,
   GetAttachedFileCommand,
   DescribeContactCommand,
+  DescribeUserCommand,
 } from "@aws-sdk/client-connect";
 
 // override: true 让 .env 成为权威来源，避免被 shell 里残留的同名环境变量覆盖
@@ -64,6 +66,36 @@ const connectClient = new ConnectClient({
 const userIdCache = new Map();
 // 队列ID -> 队列名 的缓存
 const queueNameCache = new Map();
+// userId -> 座席显示名（用户名/姓名）的缓存
+const agentNameCache = new Map();
+
+/**
+ * 根据座席 userId 解析显示名：优先“姓 名”，否则用户名，命中缓存直接返回。
+ */
+async function resolveAgentName(userId) {
+  if (!userId) return null;
+  if (agentNameCache.has(userId)) return agentNameCache.get(userId);
+  try {
+    const resp = await connectClient.send(
+      new DescribeUserCommand({
+        InstanceId: connectCfg.instanceId,
+        UserId: userId,
+      })
+    );
+    const u = resp.User || {};
+    const info = u.IdentityInfo || {};
+    const fullName = [info.FirstName, info.LastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+    const name = fullName || u.Username || userId;
+    agentNameCache.set(userId, name);
+    return name;
+  } catch (err) {
+    console.error("DescribeUser 失败:", userId, err.message);
+    return userId; // 兜底返回 userId
+  }
+}
 
 /**
  * 根据队列ID获取队列名：命中缓存直接返回，
@@ -207,6 +239,118 @@ app.get("/api/emails", async (req, res) => {
     res.json({ emails: queued });
   } catch (err) {
     console.error("SearchContacts 失败:", err);
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// ============================================================
+// 历史邮件（已完成的座席回复）：SearchContacts
+//   固定条件：Channel=EMAIL，InitiationMethod=AGENT_REPLY
+//   按时间范围（INITIATION_TIMESTAMP）筛选，服务端分页
+// 说明：SearchContacts 的 SearchCriteria 不支持 contactState 过滤，
+//   因此“COMPLETED”通过结果中存在 DisconnectTimestamp 来判定（已断开=已完成）。
+// ============================================================
+app.get("/api/history-emails", async (req, res) => {
+  try {
+    // 时间范围：默认过去 7 天
+    const now = new Date();
+    let endTime = req.query.endTime ? new Date(req.query.endTime) : now;
+    let startTime = req.query.startTime
+      ? new Date(req.query.startTime)
+      : new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    if (isNaN(endTime.getTime())) endTime = now;
+    if (isNaN(startTime.getTime()))
+      startTime = new Date(endTime.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    // 分页参数：pageSize 仅允许 25/50/100
+    const allowedSizes = [25, 50, 100];
+    let pageSize = parseInt(req.query.pageSize, 10) || 25;
+    if (!allowedSizes.includes(pageSize)) pageSize = 25;
+    let page = parseInt(req.query.page, 10) || 1;
+    if (page < 1) page = 1;
+
+    // 拉取全部匹配的联系（分页遍历），设置安全上限避免失控
+    const MAX_FETCH = 2000;
+    const contacts = [];
+    let nextToken;
+    do {
+      const command = new SearchContactsCommand({
+        InstanceId: connectCfg.instanceId,
+        TimeRange: {
+          Type: "INITIATION_TIMESTAMP",
+          StartTime: startTime,
+          EndTime: endTime,
+        },
+        SearchCriteria: {
+          Channels: ["EMAIL"],
+          InitiationMethods: ["AGENT_REPLY"],
+        },
+        Sort: {
+          FieldName: "INITIATION_TIMESTAMP",
+          Order: "DESCENDING",
+        },
+        MaxResults: 100,
+        NextToken: nextToken,
+      });
+      const resp = await connectClient.send(command);
+      (resp.Contacts || []).forEach((c) => contacts.push(c));
+      nextToken = resp.NextToken;
+    } while (nextToken && contacts.length < MAX_FETCH);
+
+    // contactState=COMPLETED：仅保留已断开（已完成）的联系
+    const completed = contacts.filter((c) => !!c.DisconnectTimestamp);
+
+    // 服务端分页
+    const total = completed.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    if (page > totalPages) page = totalPages;
+    const startIdx = (page - 1) * pageSize;
+    const pageItems = completed.slice(startIdx, startIdx + pageSize);
+
+    // 逐条 DescribeContact 补充系统/客户邮箱与座席信息（仅当前页）
+    const emails = await Promise.all(
+      pageItems.map(async (c) => {
+        let systemEmail = "-";
+        let customerEmail = "-";
+        let agentName = "-";
+        let agentId = c.AgentInfo && c.AgentInfo.Id;
+        try {
+          const d = await connectClient.send(
+            new DescribeContactCommand({
+              InstanceId: connectCfg.instanceId,
+              ContactId: c.Id,
+            })
+          );
+          const contact = d.Contact || {};
+          if (contact.SystemEndpoint && contact.SystemEndpoint.Address) {
+            systemEmail = contact.SystemEndpoint.Address;
+          }
+          if (contact.CustomerEndpoint && contact.CustomerEndpoint.Address) {
+            customerEmail = contact.CustomerEndpoint.Address;
+          }
+          if (!agentId && contact.AgentInfo && contact.AgentInfo.Id) {
+            agentId = contact.AgentInfo.Id;
+          }
+        } catch (e) {
+          console.error("DescribeContact 失败:", c.Id, e.message);
+        }
+        if (agentId) {
+          agentName = await resolveAgentName(agentId);
+        }
+        return {
+          id: c.Id,
+          name: c.Name || "(无主题)",
+          initiationTimestamp: c.InitiationTimestamp,
+          systemEmail,
+          customerEmail,
+          agent: agentName,
+        };
+      })
+    );
+
+    res.json({ total, page, pageSize, totalPages, emails });
+  } catch (err) {
+    console.error("历史邮件查询失败:", err);
     res.status(500).json({ error: err.message || String(err) });
   }
 });
@@ -402,6 +546,55 @@ app.post("/api/assign", async (req, res) => {
     console.error("TransferContact 失败:", {
       contactId: req.body && req.body.contactId,
       flowId: connectCfg.transferContactFlowId,
+      message: err.message,
+    });
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// ============================================================
+// 历史邮件回复：为已完成的邮件创建一封“座席回复”草稿并路由给当前座席
+//   使用 CreateContact：Channel=EMAIL，InitiationMethod=AGENT_REPLY，
+//   RelatedContactId=被回复的原邮件，UserInfo.UserId=当前座席。
+//   （已完成的联系无法用 TransferContact 转接，因此走 CreateContact。）
+// ============================================================
+app.post("/api/reply", async (req, res) => {
+  try {
+    const { contactId, username, userId: providedUserId } = req.body || {};
+    if (!contactId) {
+      return res.status(400).json({ error: "缺少 contactId" });
+    }
+
+    let userId = providedUserId;
+    if (!userId) {
+      userId = await resolveUserId(username);
+    }
+    if (!userId) {
+      return res
+        .status(400)
+        .json({ error: "无法确定当前座席的 userId，请检查用户名: " + username });
+    }
+
+    const command = new CreateContactCommand({
+      InstanceId: connectCfg.instanceId,
+      Channel: "EMAIL",
+      InitiationMethod: "AGENT_REPLY",
+      RelatedContactId: contactId,
+      // AGENT_REPLY 的邮件联系必须提供 UserInfo，用于路由给该座席
+      UserInfo: { UserId: userId },
+    });
+    const resp = await connectClient.send(command);
+
+    res.json({
+      success: true,
+      contactId: resp.ContactId,
+      contactArn: resp.ContactArn,
+      relatedContactId: contactId,
+      assignedUserId: userId,
+    });
+  } catch (err) {
+    console.error("CreateContact(AGENT_REPLY) 失败:", {
+      relatedContactId: req.body && req.body.contactId,
       message: err.message,
     });
     res.status(500).json({ error: err.message || String(err) });
