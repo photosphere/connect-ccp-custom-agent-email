@@ -2,6 +2,7 @@
 // 前端逻辑（Vite 入口模块）
 // amazon-connect-streams 通过 CDN <script> 注入全局 connect
 // ============================================================
+import { EmailClient } from "@amazon-connect/email";
 
 // ============================================================
 // 配置常量（硬编码到页面中）
@@ -16,6 +17,8 @@ const loginURL = "";
 // ============================================================
 let currentAgentUsername = null;
 let autoRefreshTimer = null;
+// AmazonConnectSDK 的邮件客户端（座席初始化后创建）
+let emailClient = null;
 // 可选队列列表（{id, name}）与当前选中的队列ID集合
 let availableQueues = [];
 let selectedQueueIds = new Set();
@@ -98,7 +101,32 @@ function subscribeToAgentEvents(agent) {
     currentAgentUsername = agent.getConfiguration().username;
   } catch (e) {}
   logOutput("座席已登录: " + agent.getName());
+  // 座席初始化完成后，基于 Streams 提供的配置创建 AmazonConnectSDK 邮件客户端
+  initEmailClient();
   loadEmails();
+}
+
+// ============================================================
+// 初始化 AmazonConnectSDK 的 EmailClient
+// 参考：connect.core.getSDKClientConfig()（须在座席初始化之后调用）
+// https://github.com/amazon-connect/amazon-connect-streams/blob/master/Documentation.md#connectcoregetsdkclientconfig
+// ============================================================
+function initEmailClient() {
+  if (emailClient) return;
+  try {
+    const getConfig =
+      connect.core.getSDKClientConfig || connect.core.getSdkClientConfig;
+    if (typeof getConfig !== "function") {
+      throw new Error(
+        "当前 amazon-connect-streams 版本不支持 getSDKClientConfig，请升级 Streams。"
+      );
+    }
+    const connectClientConfig = getConfig.call(connect.core);
+    emailClient = new EmailClient(connectClientConfig);
+    logOutput("EmailClient 初始化成功");
+  } catch (err) {
+    logOutput("EmailClient 初始化失败: " + (err && err.message ? err.message : String(err)));
+  }
 }
 
 // ============================================================
@@ -334,38 +362,57 @@ async function assignToMe(contactId, btn) {
 }
 
 // ============================================================
-// Reply（历史邮件）：为已完成邮件创建座席回复草稿并路由给当前座席
-// 与“排队中的邮件”的 assignToMe 不同：已完成联系不能转接，需 CreateContact
+// Reply（历史邮件）：通过 AmazonConnectSDK 的 EmailClient 创建座席回复草稿
+// 使用 emailClient.createDraftEmail({ initiationMethod: "AGENT_REPLY", ... })
+// 创建成功后草稿邮件会以 CONNECTED 状态出现在座席的 CCP 中。
+// 因为历史邮件多为已关闭（COMPLETED）联系，故使用 messageType: "REPLY_TO_CLOSED"。
 // ============================================================
 async function replyToEmail(contactId, btn) {
-  if (!currentAgentUsername) {
-    alert("无法获取当前座席信息，请等待 CCP 登录完成。");
+  if (!emailClient) {
+    // 若座席已登录但客户端尚未创建，尝试补建一次
+    initEmailClient();
+  }
+  if (!emailClient) {
+    alert("EmailClient 尚未就绪，请等待 CCP 登录完成后重试。");
     return;
   }
   btn.disabled = true;
   btn.textContent = "处理中...";
   try {
-    const resp = await fetch("/api/reply", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contactId: contactId,
-        username: currentAgentUsername,
-      }),
+    // 与 Amazon Connect 控制台原生 "Reply All" 一致：使用 OUTBOUND 发起，
+    // relatedContactId 可为任意联系（无需是入站邮件），直接引用列表中展示的联系。
+    // messageType: REPLY_TO_CLOSED 对应控制台的 SegmentAttributes.connect:TrafficType。
+    const contact = await emailClient.createDraftEmail({
+      initiationMethod: "OUTBOUND",
+      relatedContactId: contactId,
+      messageType: "REPLY_TO_CLOSED",
     });
-    const data = await resp.json();
-    if (!resp.ok || !data.success) {
-      throw new Error(data.error || "回复失败");
-    }
+    const newContactId = contact && (contact.contactId || contact.ContactId);
     logOutput(
-      "已创建座席回复: 原邮件 " + contactId + " -> 新联系 " + data.contactId
+      "已创建座席回复草稿: 原邮件 " +
+        contactId +
+        " -> 新联系 " +
+        (newContactId || "(未知)")
     );
     btn.textContent = "已回复";
     btn.classList.remove("bg-green-500", "hover:bg-green-600");
     btn.classList.add("bg-gray-400");
   } catch (err) {
-    logOutput("Reply 失败: " + err.message);
-    alert("回复失败: " + err.message);
+    // ConnectError 的真正原因在 reason / details 里，message 只是通用提示
+    const parts = [];
+    if (err && err.errorKey) parts.push("errorKey=" + err.errorKey);
+    if (err && err.reason) parts.push("reason=" + err.reason);
+    if (err && err.details && Object.keys(err.details).length) {
+      try {
+        parts.push("details=" + JSON.stringify(err.details));
+      } catch (e) {}
+    }
+    if (parts.length === 0) {
+      parts.push(err && err.message ? err.message : String(err));
+    }
+    const msg = parts.join(" | ");
+    logOutput("Reply 失败: " + msg);
+    alert("回复失败: " + msg);
     btn.disabled = false;
     btn.textContent = "Reply";
   }
