@@ -13,10 +13,26 @@
    **按 contact id 分组**并展示每封邮件正文。后端链路：`ListAssociatedContacts`（邮件线程）
    → `ListContactReferences`（EMAIL_MESSAGE 引用）→ `GetAttachedFile`（预签名 URL）
    → 下载并解析邮件内容；正文在沙箱 iframe 中渲染（禁用脚本，防止 XSS）。
-5. **AWS 凭证在环境变量中**：所有 AWS 凭证及 Connect 配置均放在 `.env` 文件。
+5. **历史邮件列表**：单独的“历史邮件”标签页，调用
+   [SearchContacts](https://docs.aws.amazon.com/connect/latest/APIReference/API_SearchContacts.html)
+   （`Channel=EMAIL`、`InitiationMethod=AGENT_REPLY`、已断开=已完成）按时间范围分页查询历史座席回复。
+6. **Reply 回复历史邮件**：每行提供 “Reply” 按钮，点击后**直接在前端**通过
+   [AmazonConnectSDK](https://github.com/amazon-connect/AmazonConnectSDK) 的
+   [`EmailClient`](https://github.com/amazon-connect/AmazonConnectSDK/tree/main/email) 创建一封回复草稿，
+   草稿会以 `CONNECTED` 状态出现在座席的 CCP 中供其编辑发送。实现与 Connect 控制台原生
+   “Reply All” 一致：`createDraftEmail({ initiationMethod: "OUTBOUND", relatedContactId, messageType: "REPLY_TO_CLOSED" })`。
+   - 座席登录后，通过 `connect.core.getSDKClientConfig()` 拿到配置并实例化 `new EmailClient(config)`
+     （参考 [Streams 文档](https://github.com/amazon-connect/amazon-connect-streams/blob/master/Documentation.md#connectcoregetsdkclientconfig)）。
+   - 用 `OUTBOUND` 发起时 `relatedContactId` 可为任意联系，因此可直接引用列表中展示的联系，
+     无需额外解析线程中的入站邮件；`messageType: "REPLY_TO_CLOSED"` 对应控制台的
+     `SegmentAttributes.connect:TrafficType`。
+   - 该调用经 CCP iframe 以当前座席身份执行，**不经过本项目后端**，也不需要额外 AWS 凭证。
+7. **AWS 凭证在环境变量中**：所有服务端 API 用到的 AWS 凭证及 Connect 配置均放在 `.env` 文件。
 
-> 说明：`SearchContacts` 与 `TransferContact` 是需要 AWS 凭证签名调用的服务端 API，
+> 说明：`SearchContacts`、`TransferContact` 及 View 相关 API 需要 AWS 凭证签名调用，
 > 因此由 Node.js 后端（`server/index.js`）代理调用，前端页面只与本后端交互，凭证不会下发到浏览器。
+> **而“Reply 回复历史邮件”是个例外**：它在前端通过 AmazonConnectSDK 的 `EmailClient` 直接调用，
+> 以当前座席在 CCP 中的登录态执行，不经过后端。
 
 ## 目录结构
 
@@ -28,7 +44,7 @@
 .
 ├── email.html            # 前端页面（Vite 入口）
 ├── src/
-│   └── main.js           # 前端逻辑（CCP 初始化、邮件列表、Assign to Me）
+│   └── main.js           # 前端逻辑（CCP 初始化、邮件列表、Assign to Me、EmailClient 回复）
 ├── server/
 │   └── index.js          # Node.js/Express 后端，代理调用 Connect API
 ├── .env                  # 实际配置（含 AWS 凭证，已加入 .gitignore）
@@ -74,6 +90,10 @@ cp env.example .env
 - `connect:DescribeQueue`（用于把队列 ID 解析为队列名）
 - `connect:ListAssociatedContacts`、`connect:ListContactReferences`、`connect:DescribeContact`、`connect:GetAttachedFile`（用于 View 查看邮件历史与正文）
 
+> “Reply 回复历史邮件”通过前端的 AmazonConnectSDK `EmailClient` 以当前座席身份执行，
+> **不使用后端凭证**，因此无需为后端额外授予 `connect:CreateContact` 权限；
+> 对应权限由座席的 CCP 登录态承载。
+
 ## 运行
 
 安装依赖：
@@ -117,4 +137,14 @@ npm start
   包含主题、渠道、队列、入队时间、等待时长与 Contact ID。
 - **Assign to Me**：点击后将该邮件通过 `TransferContact` 转接到当前座席的个人队列。
   完成后列表会自动刷新。
+- **历史邮件 / Reply**：切换到“历史邮件”标签，选择时间范围查询已完成的座席回复；
+  点击某行的 “Reply” 按钮，会通过 AmazonConnectSDK 的 `EmailClient` 创建回复草稿并在 CCP 中打开供编辑。
+  该操作需先完成 CCP 登录（座席初始化后才会创建 `EmailClient`）。
+
+## 依赖说明
+
+- [`amazon-connect-streams`](https://github.com/amazon-connect/amazon-connect-streams)：通过 CDN `<script>`
+  注入全局 `connect`，用于初始化 CCP 并提供 `connect.core.getSDKClientConfig()`。
+- [`@amazon-connect/email`](https://github.com/amazon-connect/AmazonConnectSDK/tree/main/email)：
+  AmazonConnectSDK 的邮件客户端，前端用它执行 `createDraftEmail` 创建回复草稿。
 
