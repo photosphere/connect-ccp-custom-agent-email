@@ -6,7 +6,6 @@ import {
   ConnectClient,
   SearchContactsCommand,
   TransferContactCommand,
-  CreateContactCommand,
   ListUsersCommand,
   DescribeQueueCommand,
   ListAssociatedContactsCommand,
@@ -546,55 +545,6 @@ app.post("/api/assign", async (req, res) => {
     console.error("TransferContact 失败:", {
       contactId: req.body && req.body.contactId,
       flowId: connectCfg.transferContactFlowId,
-      message: err.message,
-    });
-    res.status(500).json({ error: err.message || String(err) });
-  }
-});
-
-// ============================================================
-// 历史邮件回复：为已完成的邮件创建一封“座席回复”草稿并路由给当前座席
-//   使用 CreateContact：Channel=EMAIL，InitiationMethod=AGENT_REPLY，
-//   RelatedContactId=被回复的原邮件，UserInfo.UserId=当前座席。
-//   （已完成的联系无法用 TransferContact 转接，因此走 CreateContact。）
-// ============================================================
-app.post("/api/reply", async (req, res) => {
-  try {
-    const { contactId, username, userId: providedUserId } = req.body || {};
-    if (!contactId) {
-      return res.status(400).json({ error: "缺少 contactId" });
-    }
-
-    let userId = providedUserId;
-    if (!userId) {
-      userId = await resolveUserId(username);
-    }
-    if (!userId) {
-      return res
-        .status(400)
-        .json({ error: "无法确定当前座席的 userId，请检查用户名: " + username });
-    }
-
-    const command = new CreateContactCommand({
-      InstanceId: connectCfg.instanceId,
-      Channel: "EMAIL",
-      InitiationMethod: "AGENT_REPLY",
-      RelatedContactId: contactId,
-      // AGENT_REPLY 的邮件联系必须提供 UserInfo，用于路由给该座席
-      UserInfo: { UserId: userId },
-    });
-    const resp = await connectClient.send(command);
-
-    res.json({
-      success: true,
-      contactId: resp.ContactId,
-      contactArn: resp.ContactArn,
-      relatedContactId: contactId,
-      assignedUserId: userId,
-    });
-  } catch (err) {
-    console.error("CreateContact(AGENT_REPLY) 失败:", {
-      relatedContactId: req.body && req.body.contactId,
       message: err.message,
     });
     res.status(500).json({ error: err.message || String(err) });
