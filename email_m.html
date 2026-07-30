@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Amazon Connect Email - Mailbox</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/amazon-connect-streams@2.18.3/release/connect-streams.js"></script>
+    <style>
+      /* CCP 初始化时保持在 DOM 中但对用户不可见（离屏），
+         点击 Reply 后再显示到可见区域。 */
+      #ccpHost.ccp-hidden {
+        position: absolute;
+        left: -10000px;
+        top: 0;
+        width: 420px;
+        height: 600px;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+
+  <body class="bg-gray-50">
+    <!-- 顶部标题栏 -->
+    <div
+      class="h-14 bg-gradient-to-r from-blue-600 to-blue-700 border-b border-blue-800 flex items-center justify-between px-6"
+    >
+      <h1 class="text-xl font-bold text-white">Amazon Connect Email</h1>
+      <div class="flex items-center gap-3">
+        <span id="agentStatus" class="text-xs text-white/80">CCP 初始化中...</span>
+        <button
+          class="px-3 py-1.5 text-sm bg-white/20 text-white rounded-lg hover:bg-white/30 transition"
+          id="logContainer-btn"
+          onclick="showLog()"
+        >
+          日志
+        </button>
+      </div>
+    </div>
+
+    <!-- 两列布局：左 Email Contact / 右 Email Information -->
+    <div id="split" class="flex" style="height: calc(100vh - 3.5rem)">
+      <!-- 左列：Email Contact -->
+      <div id="leftCol" class="flex flex-col overflow-hidden bg-white" style="width: 30%">
+        <div class="px-4 py-3 border-b border-gray-200 flex-shrink-0">
+          <h2 class="text-base font-bold text-gray-800">Email Contact</h2>
+        </div>
+
+        <!-- Tab 栏 -->
+        <div class="flex items-end gap-1 px-3 pt-2 border-b border-gray-200 flex-shrink-0">
+          <button
+            id="tabUnread"
+            onclick="switchTab('unread')"
+            class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent -mb-px transition"
+          >
+            Unread
+            <span
+              id="unreadCount"
+              class="ml-1 px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full"
+              >0</span
+            >
+          </button>
+          <button
+            id="tabRead"
+            onclick="switchTab('read')"
+            class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent -mb-px transition"
+          >
+            Read
+            <span
+              id="readCount"
+              class="ml-1 px-2 py-0.5 text-xs bg-blue-100 text-blue-700 rounded-full"
+              >0</span
+            >
+          </button>
+        </div>
+
+        <!-- Unread 视图 -->
+        <div id="unreadView" class="flex-1 flex flex-col overflow-hidden min-h-0">
+          <div class="px-3 py-2 border-b border-gray-100 flex items-center justify-between flex-shrink-0">
+            <span class="text-xs text-gray-500">排队中的邮件</span>
+            <button
+              onclick="loadUnread()"
+              class="px-2.5 py-1 text-xs bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition"
+            >
+              刷新
+            </button>
+          </div>
+          <div id="unreadList" class="flex-1 overflow-auto p-3 space-y-2 min-h-0">
+            <div class="text-center text-gray-400 text-sm py-6">
+              请等待 CCP 登录完成后自动加载。
+            </div>
+          </div>
+        </div>
+
+        <!-- Read 视图 -->
+        <div id="readView" class="hidden flex-1 flex-col overflow-hidden min-h-0">
+          <!-- 日期查询条 -->
+          <div class="px-3 py-2 border-b border-gray-100 space-y-2 flex-shrink-0 bg-gray-50">
+            <label class="flex items-center gap-1 text-xs text-gray-500">
+              <span class="w-8">From</span>
+              <input
+                type="datetime-local"
+                id="histStart"
+                class="flex-1 px-2 py-1 text-xs border border-gray-300 rounded-lg"
+              />
+            </label>
+            <label class="flex items-center gap-1 text-xs text-gray-500">
+              <span class="w-8">To</span>
+              <input
+                type="datetime-local"
+                id="histEnd"
+                class="flex-1 px-2 py-1 text-xs border border-gray-300 rounded-lg"
+              />
+            </label>
+            <div class="flex justify-end">
+              <button
+                onclick="loadRead(1)"
+                class="px-3 py-1.5 text-xs bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition"
+              >
+                Search
+              </button>
+            </div>
+          </div>
+          <div id="readList" class="flex-1 overflow-auto p-3 space-y-2 min-h-0">
+            <div class="text-center text-gray-400 text-sm py-6">
+              选择时间范围后点击 Search 查询历史邮件。
+            </div>
+          </div>
+          <!-- 分页 -->
+          <div class="px-3 py-2 border-t border-gray-200 bg-gray-50 flex items-center justify-between flex-shrink-0">
+            <span id="readPageInfo" class="text-xs text-gray-500">共 0 条</span>
+            <div class="flex items-center gap-1">
+              <button
+                id="readPrevBtn"
+                onclick="readPrevPage()"
+                class="px-2 py-1 text-xs bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-lg font-medium transition disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                上一页
+              </button>
+              <button
+                id="readNextBtn"
+                onclick="readNextPage()"
+                class="px-2 py-1 text-xs bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-lg font-medium transition disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                下一页
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 拖拽分隔符 -->
+      <div
+        id="colResizer"
+        class="w-1.5 bg-gray-200 hover:bg-blue-400 cursor-col-resize flex-shrink-0 transition-colors"
+        title="拖动调整左右比例"
+      ></div>
+
+      <!-- 右列：Email Information -->
+      <div id="rightCol" class="flex-1 flex flex-col overflow-hidden min-w-0">
+        <div class="px-4 py-3 border-b border-gray-200 flex-shrink-0 bg-white">
+          <h2 class="text-base font-bold text-gray-800">Email Information</h2>
+        </div>
+
+        <div class="flex-1 flex overflow-hidden min-h-0">
+          <!-- 邮件内容区 -->
+          <div id="emailInfo" class="flex-1 overflow-auto p-4 min-w-0">
+            <div class="text-center text-gray-400 py-16">
+              从左侧选择一个 Email Contact 查看详情。
+            </div>
+          </div>
+
+          <!-- CCP 面板（默认离屏隐藏，点击 Reply 后显示） -->
+          <div
+            id="ccpHost"
+            class="ccp-hidden flex-col border-l border-gray-200 bg-white flex-shrink-0"
+            style="width: 420px"
+          >
+            <div
+              class="px-3 py-2 border-b border-gray-200 bg-gray-50 flex items-center justify-between flex-shrink-0"
+            >
+              <span class="text-sm font-semibold text-gray-700">CCP</span>
+              <button
+                onclick="hideCcp()"
+                class="px-2 py-1 text-sm text-gray-500 hover:text-gray-800"
+              >
+                ✕
+              </button>
+            </div>
+            <div id="container-div" class="flex-1 min-h-0"></div>
+          </div>
+        </div>
+
+        <!-- 日志容器 -->
+        <div
+          id="logContainer"
+          class="hidden border-t border-gray-200 p-3 bg-gray-50 flex-shrink-0"
+        >
+          <div class="flex justify-between items-center mb-2">
+            <span class="text-xs text-gray-500 font-medium">系统日志</span>
+            <button
+              class="px-2 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded transition"
+              onclick="clearOutput()"
+            >
+              清除
+            </button>
+          </div>
+          <textarea
+            id="logDisplay"
+            readonly
+            class="w-full h-32 text-xs border border-gray-300 rounded p-2 resize-none font-mono bg-white"
+          ></textarea>
+        </div>
+      </div>
+    </div>
+
+    <textarea id="message" style="display: none"></textarea>
+
+    <script type="module" src="/src/main_m.js"></script>
+  </body>
+</html>

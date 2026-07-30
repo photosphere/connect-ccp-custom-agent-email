@@ -6,6 +6,7 @@ import {
   ConnectClient,
   SearchContactsCommand,
   TransferContactCommand,
+  CreateContactCommand,
   ListUsersCommand,
   DescribeQueueCommand,
   ListAssociatedContactsCommand,
@@ -235,6 +236,31 @@ app.get("/api/emails", async (req, res) => {
       q.queueName = queueNameCache.get(q.queueId) || q.queueId;
     });
 
+    // 补充客户邮箱地址（DescribeContact），供列表展示使用
+    await Promise.all(
+      queued.map(async (q) => {
+        q.customerEmail = "-";
+        q.systemEmail = "-";
+        try {
+          const d = await connectClient.send(
+            new DescribeContactCommand({
+              InstanceId: connectCfg.instanceId,
+              ContactId: q.id,
+            })
+          );
+          const contact = d.Contact || {};
+          if (contact.CustomerEndpoint && contact.CustomerEndpoint.Address) {
+            q.customerEmail = contact.CustomerEndpoint.Address;
+          }
+          if (contact.SystemEndpoint && contact.SystemEndpoint.Address) {
+            q.systemEmail = contact.SystemEndpoint.Address;
+          }
+        } catch (e) {
+          console.error("DescribeContact(排队邮件) 失败:", q.id, e.message);
+        }
+      })
+    );
+
     res.json({ emails: queued });
   } catch (err) {
     console.error("SearchContacts 失败:", err);
@@ -261,8 +287,8 @@ app.get("/api/history-emails", async (req, res) => {
     if (isNaN(startTime.getTime()))
       startTime = new Date(endTime.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-    // 分页参数：pageSize 仅允许 25/50/100
-    const allowedSizes = [25, 50, 100];
+    // 分页参数：pageSize 仅允许 20/25/50/100
+    const allowedSizes = [20, 25, 50, 100];
     let pageSize = parseInt(req.query.pageSize, 10) || 25;
     if (!allowedSizes.includes(pageSize)) pageSize = 25;
     let page = parseInt(req.query.page, 10) || 1;
@@ -552,13 +578,62 @@ app.post("/api/assign", async (req, res) => {
 });
 
 // ============================================================
+// Reply（历史/已关闭邮件）：使用服务端 IAM 凭证创建座席回复草稿
+//   等价于前端 EmailClient.createDraftEmail，但改由后端凭证执行，
+//   避免座席联邦会话缺少 connect:CreateContact 权限导致 AccessDenied。
+//   CreateContact: Channel=EMAIL, InitiationMethod=OUTBOUND,
+//                  RelatedContactId=<被回复的联系>, UserInfo={UserId}
+//   创建成功后，草稿邮件会以 CONNECTED 状态出现在该座席的 CCP 中。
+// ============================================================
+app.post("/api/reply", async (req, res) => {
+  try {
+    const { contactId, username, userId: providedUserId } = req.body || {};
+    if (!contactId) {
+      return res.status(400).json({ error: "缺少 contactId" });
+    }
+
+    let userId = providedUserId;
+    if (!userId) {
+      userId = await resolveUserId(username);
+    }
+    if (!userId) {
+      return res
+        .status(400)
+        .json({ error: "无法确定当前座席的 userId，请检查用户名: " + username });
+    }
+
+    const command = new CreateContactCommand({
+      InstanceId: connectCfg.instanceId,
+      Channel: "EMAIL",
+      InitiationMethod: "OUTBOUND",
+      RelatedContactId: contactId,
+      UserInfo: { UserId: userId },
+    });
+    const resp = await connectClient.send(command);
+
+    res.json({
+      success: true,
+      contactId: resp.ContactId,
+      contactArn: resp.ContactArn,
+      assignedUserId: userId,
+    });
+  } catch (err) {
+    console.error("CreateContact(Reply) 失败:", {
+      contactId: req.body && req.body.contactId,
+      message: err.message,
+    });
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// ============================================================
 // 生产环境直接托管 Vite 构建产物 dist/
 // ============================================================
 if (process.env.NODE_ENV === "production") {
   const distPath = path.join(ROOT, "dist");
   app.use(express.static(distPath));
   app.get("*", (req, res) => {
-    res.sendFile(path.join(distPath, "email.html"));
+    res.sendFile(path.join(distPath, "email_m.html"));
   });
 }
 

@@ -5,12 +5,15 @@ export default defineConfig({
   build: {
     outDir: "dist",
     rollupOptions: {
-      input: "email.html",
+      input: {
+        email: "email.html",
+        email_m: "email_m.html",
+      },
     },
   },
   server: {
     port: 8080,
-    open: "/email.html",
+    open: "/email_m.html",
     // 开发环境把 /api 请求转发到后端
     proxy: {
       "/api": {
