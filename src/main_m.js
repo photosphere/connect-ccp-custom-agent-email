@@ -21,8 +21,11 @@ const READ_PAGE_SIZE = 20;
 // 全局状态
 // ============================================================
 let currentAgentUsername = null;
+let currentAgent = null;
+let agentStateListenerAttached = false;
 let emailClient = null;
 let ccpInitialized = false;
+let ccpLoggedIn = false;
 
 // 当前选中的联系（用于 Reply / Forward）
 // { id, subject, type: "unread" | "read", customerEmail, systemEmail, agent }
@@ -102,14 +105,132 @@ function escapeText(s) {
 // 已登录则 Streams 会自动复用会话，不再弹出登录窗口。
 // ============================================================
 function subscribeToAgentEvents(agent) {
+  currentAgent = agent;
+  ccpLoggedIn = true;
+  updateAuthButton();
   try {
     currentAgentUsername = agent.getConfiguration().username;
   } catch (e) {}
   logOutput("座席已登录: " + agent.getName());
   $("agentStatus").textContent = "已登录: " + agent.getName();
+
+  // 座席状态下拉框：填充可选状态、同步当前状态、监听状态变化
+  populateAgentStates(agent);
+  agent.onStateChange(() => updateAgentStateSelect(agent));
+  agent.onRefresh(() => updateAgentStateSelect(agent));
+
   initEmailClient();
-  // 登录完成后自动加载 Unread 列表
-  loadUnread();
+  // 注意：Unread 列表由服务端 IAM 凭证调用 Connect API（/api/emails）获取，
+  // 不依赖座席 CCP 登录，已在页面加载时加载，这里无需再次加载。
+}
+
+// ============================================================
+// 座席状态下拉框
+//   - getAgentStates(): 座席可手动选择的状态（Available + 自定义离线 + Offline）
+//   - getState():       当前状态（可能是系统状态，如 Busy / AfterCallWork）
+//   - setState():       切换状态
+// ============================================================
+function populateAgentStates(agent) {
+  const sel = $("agentStateSelect");
+  const wrap = $("agentStateWrap");
+  if (!sel || !wrap) return;
+
+  let states = [];
+  try {
+    states = agent.getAgentStates() || [];
+  } catch (e) {
+    logOutput("获取座席状态列表失败: " + (e && e.message ? e.message : e));
+  }
+
+  sel.innerHTML = "";
+  states.forEach((s) => {
+    const opt = document.createElement("option");
+    opt.value = s.name;
+    opt.textContent = s.name;
+    sel.appendChild(opt);
+  });
+
+  wrap.classList.remove("hidden");
+  wrap.classList.add("flex");
+
+  // 只绑定一次 change 事件
+  if (!agentStateListenerAttached) {
+    agentStateListenerAttached = true;
+    sel.addEventListener("change", onAgentStateSelect);
+  }
+
+  updateAgentStateSelect(agent);
+}
+
+/** 将下拉框与座席真实状态保持同步 */
+function updateAgentStateSelect(agent) {
+  const sel = $("agentStateSelect");
+  if (!sel) return;
+
+  let st = null;
+  try {
+    st = agent.getState();
+  } catch (e) {
+    return;
+  }
+  const name = st ? st.name : "";
+  const type = st ? st.type : "";
+
+  // 若当前是系统状态（如 Busy / AfterCallWork），不在可选列表中，
+  // 临时插入一个只读选项以正确显示当前状态。
+  const exists = Array.from(sel.options).some((o) => o.value === name);
+  // 先清除上一次插入的系统状态临时项
+  Array.from(sel.options).forEach((o) => {
+    if (o.dataset.system === "1" && o.value !== name) o.remove();
+  });
+  if (!exists && name) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    opt.dataset.system = "1";
+    sel.appendChild(opt);
+  }
+  sel.value = name;
+
+  // 状态指示点颜色
+  const dot = $("agentStateDot");
+  if (dot) {
+    let color = "bg-gray-300";
+    if (type === connect.AgentStateType.ROUTABLE) color = "bg-green-400";
+    else if (type === connect.AgentStateType.NOT_ROUTABLE) color = "bg-amber-400";
+    else if (type === connect.AgentStateType.OFFLINE) color = "bg-gray-400";
+    else if (type === connect.AgentStateType.ERROR) color = "bg-red-500";
+    else if (name && name !== "Offline") color = "bg-blue-400";
+    dot.className = "w-2 h-2 rounded-full " + color;
+    dot.title = "座席状态: " + (name || "-");
+  }
+}
+
+/** 用户在下拉框中选择状态时切换座席状态 */
+function onAgentStateSelect() {
+  const sel = $("agentStateSelect");
+  if (!sel || !currentAgent) return;
+  const targetName = sel.value;
+  let target = null;
+  try {
+    target = (currentAgent.getAgentStates() || []).find(
+      (s) => s.name === targetName
+    );
+  } catch (e) {}
+  if (!target) {
+    // 选中的是系统状态（不可手动切换），恢复为真实状态
+    updateAgentStateSelect(currentAgent);
+    return;
+  }
+  currentAgent.setState(target, {
+    success: () => logOutput("座席状态已切换为: " + target.name),
+    failure: (err) => {
+      logOutput(
+        "座席状态切换失败: " + (err && err.message ? err.message : String(err))
+      );
+      updateAgentStateSelect(currentAgent);
+    },
+  });
 }
 
 function initEmailClient() {
@@ -162,24 +283,205 @@ function initCcp() {
     });
 
     connect.agent(subscribeToAgentEvents);
+    // 订阅联系事件：电话 / Chat 进线自动浮层显示 CCP；ACW 后联系结束自动隐藏
+    connect.contact(subscribeToContactEvents);
   } catch (err) {
     logOutput("CCP初始化失败: " + JSON.stringify(err));
   }
 }
 
 // ============================================================
-// CCP 显示 / 隐藏
+// 联系（Contact）事件订阅
+//   - 实时电话 / Chat 进线（connecting / incoming）→ showCcpFloat() 浮层显示
+//   - 联系结束（ACW 事件之后 contact 被销毁）→ toggleCcpFloat() 隐藏
+//   - 邮件（EMAIL）等非实时渠道不触发浮层
 // ============================================================
+function isRealtimeContact(type) {
+  return (
+    type === connect.ContactType.VOICE ||
+    type === connect.ContactType.CHAT ||
+    type === connect.ContactType.QUEUE_CALLBACK
+  );
+}
+
+function subscribeToContactEvents(contact) {
+  let type = "";
+  try {
+    type = contact.getType();
+  } catch (e) {}
+
+  // 仅处理实时电话 / Chat 渠道
+  if (!isRealtimeContact(type)) {
+    logOutput("联系接入(非实时渠道，跳过浮层): " + type);
+    return;
+  }
+
+  logOutput("实时联系接入: " + type + " / " + contact.getContactId());
+
+  let acwTriggered = false;
+
+  const showFloat = () => {
+    const host = $("ccpHost");
+    // 未处于浮层可见状态时才显示，避免重复
+    if (
+      !host.classList.contains("ccp-float") ||
+      host.classList.contains("ccp-hidden")
+    ) {
+      showCcpFloat();
+    }
+  };
+
+  // 进线 / 连接中 → 浮层显示
+  contact.onConnecting(showFloat);
+  contact.onIncoming(showFloat);
+  contact.onConnected(showFloat);
+
+  // ACW（话后处理）事件
+  contact.onACW(() => {
+    acwTriggered = true;
+    logOutput("联系进入 ACW（话后处理）: " + contact.getContactId());
+  });
+
+  // 联系结束（在 ACW 之后被销毁）→ 隐藏浮层 CCP
+  contact.onDestroy(() => {
+    logOutput(
+      "联系结束(ACW 已" +
+        (acwTriggered ? "触发" : "未触发") +
+        "): " +
+        contact.getContactId()
+    );
+    const host = $("ccpHost");
+    // 仅当浮层仍处于可见状态时才调用 toggleCcpFloat() 将其隐藏
+    if (
+      host.classList.contains("ccp-float") &&
+      !host.classList.contains("ccp-hidden")
+    ) {
+      toggleCcpFloat();
+    }
+  });
+}
+
+// ============================================================
+// CCP 显示 / 隐藏
+//
+// 同一个 CCP（#ccpHost 内的 iframe）根据渠道以两种形态出现：
+//   - 邮件渠道（Reply / Forward）：内嵌在右侧邮件信息栏，非浮层。
+//   - 电话 / Chat 渠道（点击顶部 Amazon Connect logo）：position:fixed 浮层。
+// 两种形态只切换 CSS 定位，不移动 iframe DOM 节点，避免 CCP 重新加载。
+// ============================================================
+
+/** 内嵌形态：用于邮件渠道回复 */
 function showCcp() {
   const host = $("ccpHost");
-  host.classList.remove("ccp-hidden");
+  host.classList.remove("ccp-hidden", "ccp-float");
   host.classList.add("flex");
+  $("ccpTitle").textContent = "CCP · 邮件";
+}
+
+/** 浮层形态：用于实时电话 / Chat 渠道 */
+function showCcpFloat() {
+  const host = $("ccpHost");
+  host.classList.remove("ccp-hidden");
+  host.classList.add("flex", "ccp-float");
+  $("ccpTitle").textContent = "CCP · 电话 / Chat";
 }
 
 function hideCcp() {
   const host = $("ccpHost");
-  host.classList.remove("flex");
+  host.classList.remove("flex", "ccp-float");
   host.classList.add("ccp-hidden");
+  // 清除拖拽产生的内联定位，下次浮层回到默认位置
+  host.style.top = "";
+  host.style.left = "";
+  host.style.right = "";
+}
+
+/** 顶部 logo 点击：切换电话 / Chat 浮层 CCP 的显示 */
+function toggleCcpFloat() {
+  const host = $("ccpHost");
+  const visible = !host.classList.contains("ccp-hidden");
+  const floating = host.classList.contains("ccp-float");
+  if (visible && floating) {
+    hideCcp();
+  } else {
+    showCcpFloat();
+  }
+}
+
+// ============================================================
+// CCP 登录 / 退出
+//   - 登录：重新初始化 CCP（未登录时会弹出 Connect 登录窗口）
+//   - 退出：调用实例注销端点 + 触发 Streams TERMINATE 事件，重置界面
+// ============================================================
+function updateAuthButton() {
+  const btn = $("ccpAuthBtn");
+  if (!btn) return;
+  btn.textContent = ccpLoggedIn ? "退出" : "登录";
+  btn.title = ccpLoggedIn ? "退出当前座席" : "登录座席 CCP";
+}
+
+/** 登录 / 退出按钮点击入口 */
+function ccpAuth() {
+  if (ccpLoggedIn) {
+    ccpLogout();
+  } else {
+    ccpLogin();
+  }
+}
+
+/** 登录：重新初始化 CCP，未登录时会弹出 Connect 登录窗口 */
+function ccpLogin() {
+  logOutput("正在打开 CCP 登录…");
+  $("agentStatus").textContent = "CCP 登录中…";
+  // 允许重新初始化（首次加载时可能已初始化但未登录）
+  ccpInitialized = false;
+  const container = $("container-div");
+  if (container) container.innerHTML = "";
+  initCcp();
+}
+
+/** 退出：注销服务端会话并终止本地 CCP 会话 */
+function ccpLogout() {
+  logOutput("正在退出座席…");
+  // 1. 请求实例注销端点，清除 Connect 服务端会话
+  try {
+    const img = new Image();
+    img.src = instanceURL + "logout?nonce=" + Date.now();
+  } catch (e) {}
+  // 2. 通知 Streams 终止当前 CCP 会话
+  try {
+    connect.core.getEventBus().trigger(connect.EventType.TERMINATE);
+  } catch (e) {
+    logOutput("终止 CCP 会话失败: " + (e && e.message ? e.message : e));
+  }
+  // 3. 稍后重置本地状态与界面（等待注销请求发出）
+  setTimeout(resetLoggedOutUI, 600);
+}
+
+/** 退出后重置本地状态与界面 */
+function resetLoggedOutUI() {
+  currentAgent = null;
+  currentAgentUsername = null;
+  ccpLoggedIn = false;
+  emailClient = null;
+  ccpInitialized = false;
+
+  $("agentStatus").textContent = "未登录";
+
+  // 隐藏座席状态下拉框
+  const wrap = $("agentStateWrap");
+  if (wrap) {
+    wrap.classList.add("hidden");
+    wrap.classList.remove("flex");
+  }
+
+  // 隐藏并清空 CCP 容器
+  hideCcp();
+  const container = $("container-div");
+  if (container) container.innerHTML = "";
+
+  updateAuthButton();
+  logOutput("座席已退出。");
 }
 
 // ============================================================
@@ -245,8 +547,6 @@ function highlightCard(card) {
 // ============================================================
 async function loadUnread() {
   const list = $("unreadList");
-  list.innerHTML =
-    '<div class="text-center text-gray-400 text-sm py-6">加载中...</div>';
   try {
     const resp = await fetch("/api/emails", { cache: "no-store" });
     const data = await resp.json();
@@ -275,8 +575,6 @@ async function loadUnread() {
 async function loadRead(page) {
   if (typeof page === "number") readPage = page;
   const list = $("readList");
-  list.innerHTML =
-    '<div class="text-center text-gray-400 text-sm py-6">加载中...</div>';
 
   const startVal = $("histStart").value;
   const endVal = $("histEnd").value;
@@ -544,8 +842,18 @@ async function loadThread(contactId, container) {
 //   Read   -> replyToEmail（创建座席回复草稿）
 // 两者都会显示 CCP 供座席回复。
 // ============================================================
+/** CCP 是否已登录完成（座席对象与用户名均就绪） */
+function isCcpLoggedIn() {
+  return !!(currentAgent && currentAgentUsername);
+}
+
 async function doReply(btn) {
   if (!currentContact) return;
+  // 回复需要通过座席 CCP 处理，未登录完成时给出友情提示
+  if (!isCcpLoggedIn()) {
+    alert("CCP 尚未登录完成，请等待右上角显示“已登录: 座席名”后再进行回复。");
+    return;
+  }
   // 显示 CCP 进行回复
   showCcp();
   if (currentContact.type === "unread") {
@@ -702,6 +1010,59 @@ function switchTab(tab) {
 })();
 
 // ============================================================
+// 浮层 CCP 拖拽（仅在 ccp-float 形态下生效）
+// ============================================================
+(function initCcpDrag() {
+  const host = $("ccpHost");
+  const handle = $("ccpDragHandle");
+  if (!host || !handle) return;
+
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  let startLeft = 0;
+  let startTop = 0;
+
+  handle.addEventListener("mousedown", (e) => {
+    // 仅浮层形态可拖拽；点击关闭按钮不触发
+    if (!host.classList.contains("ccp-float")) return;
+    if (e.target.closest("button")) return;
+    dragging = true;
+    const rect = host.getBoundingClientRect();
+    startX = e.clientX;
+    startY = e.clientY;
+    startLeft = rect.left;
+    startTop = rect.top;
+    // 切换为以 left/top 定位，取消 right 约束
+    host.style.right = "auto";
+    host.style.left = startLeft + "px";
+    host.style.top = startTop + "px";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    let newLeft = startLeft + (e.clientX - startX);
+    let newTop = startTop + (e.clientY - startY);
+    // 约束在视口内
+    const w = host.offsetWidth;
+    const h = host.offsetHeight;
+    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - w));
+    newTop = Math.max(0, Math.min(newTop, window.innerHeight - h));
+    host.style.left = newLeft + "px";
+    host.style.top = newTop + "px";
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (dragging) {
+      dragging = false;
+      document.body.style.userSelect = "";
+    }
+  });
+})();
+
+// ============================================================
 // 历史邮件时间范围默认值（过去 7 天）
 // ============================================================
 (function initReadControls() {
@@ -723,10 +1084,16 @@ Object.assign(window, {
   readPrevPage,
   readNextPage,
   hideCcp,
+  toggleCcpFloat,
+  onAgentStateSelect,
+  ccpAuth,
 });
 
 // 默认激活 Unread 标签
 switchTab("unread");
+
+// 排队邮件走服务端 Connect API，与 CCP 登录无关，页面加载即拉取
+loadUnread();
 
 // 页面加载即初始化 CCP（隐藏，仅做登录验证；已登录则复用会话）
 initCcp();

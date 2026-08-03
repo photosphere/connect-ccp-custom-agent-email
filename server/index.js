@@ -40,6 +40,12 @@ const connectCfg = {
     .map((s) => s.trim())
     .filter(Boolean),
   searchLookbackDays: parseInt(process.env.SEARCH_LOOKBACK_DAYS, 10) || 7,
+  // 历史邮件按发起方式过滤（可选）。留空 = 不限制，搜索所有邮件联系。
+  // 例如只看座席回复与外呼：CONNECT_HISTORY_INITIATION_METHODS=AGENT_REPLY,OUTBOUND
+  historyInitiationMethods: (process.env.CONNECT_HISTORY_INITIATION_METHODS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 };
 
 if (!AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !connectCfg.instanceId) {
@@ -297,6 +303,12 @@ app.get("/api/history-emails", async (req, res) => {
     // 拉取全部匹配的联系（分页遍历），设置安全上限避免失控
     const MAX_FETCH = 2000;
     const contacts = [];
+    // 搜索条件：默认只按渠道=EMAIL；发起方式仅在显式配置时才收窄。
+    const searchCriteria = { Channels: ["EMAIL"] };
+    if (connectCfg.historyInitiationMethods.length > 0) {
+      searchCriteria.InitiationMethods = connectCfg.historyInitiationMethods;
+    }
+
     let nextToken;
     do {
       const command = new SearchContactsCommand({
@@ -306,10 +318,7 @@ app.get("/api/history-emails", async (req, res) => {
           StartTime: startTime,
           EndTime: endTime,
         },
-        SearchCriteria: {
-          Channels: ["EMAIL"],
-          InitiationMethods: ["AGENT_REPLY"],
-        },
+        SearchCriteria: searchCriteria,
         Sort: {
           FieldName: "INITIATION_TIMESTAMP",
           Order: "DESCENDING",
@@ -324,6 +333,15 @@ app.get("/api/history-emails", async (req, res) => {
 
     // contactState=COMPLETED：仅保留已断开（已完成）的联系
     const completed = contacts.filter((c) => !!c.DisconnectTimestamp);
+
+    console.log(
+      `[history-emails] ${startTime.toISOString()} ~ ${endTime.toISOString()} | ` +
+        `发起方式过滤=${
+          searchCriteria.InitiationMethods
+            ? searchCriteria.InitiationMethods.join(",")
+            : "(不限)"
+        } | 原始命中 ${contacts.length} 条，已完成(有DisconnectTimestamp) ${completed.length} 条`
+    );
 
     // 服务端分页
     const total = completed.length;

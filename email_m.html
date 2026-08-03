@@ -16,6 +16,28 @@
         height: 600px;
         overflow: hidden;
       }
+
+      /* 浮动模式（电话 / Chat 渠道）：同一个 CCP 以浮层形式出现，
+         不再嵌入右侧邮件信息栏。通过 position:fixed 脱离文档流，
+         不移动 iframe DOM 节点，避免 CCP 重新加载。 */
+      #ccpHost.ccp-float {
+        position: fixed;
+        top: 4.5rem;
+        right: 1.5rem;
+        left: auto;
+        width: 420px;
+        height: 620px;
+        z-index: 50;
+        border: 1px solid #e5e7eb;
+        border-radius: 0.75rem;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+        overflow: hidden;
+      }
+
+      /* 浮动模式下拖拽把手 */
+      #ccpHost.ccp-float #ccpDragHandle {
+        cursor: move;
+      }
     </style>
   </head>
 
@@ -26,7 +48,55 @@
     >
       <h1 class="text-xl font-bold text-white">Amazon Connect Email</h1>
       <div class="flex items-center gap-3">
+        <!-- Amazon Connect logo：点击以浮层方式打开 CCP，处理实时电话 / Chat 渠道 -->
+        <button
+          id="ccpLogoBtn"
+          onclick="toggleCcpFloat()"
+          title="Amazon Connect CCP（电话 / Chat）"
+          class="flex items-center justify-center w-9 h-9 bg-white/20 text-white rounded-lg hover:bg-white/30 transition"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="w-5 h-5"
+          >
+            <path d="M4 14v-2a8 8 0 0 1 16 0v2" />
+            <path
+              d="M20 14h-1.5a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 18.5 19H19a1 1 0 0 0 1-1v-4z"
+            />
+            <path
+              d="M4 14h1.5A1.5 1.5 0 0 1 7 15.5v2A1.5 1.5 0 0 1 5.5 19H5a1 1 0 0 1-1-1v-4z"
+            />
+            <path d="M12 19v1a2 2 0 0 1-2 2H9" />
+          </svg>
+        </button>
         <span id="agentStatus" class="text-xs text-white/80">CCP 初始化中...</span>
+        <!-- CCP 座席状态下拉框：显示并切换当前座席状态 -->
+        <div class="hidden items-center gap-1.5" id="agentStateWrap">
+          <span
+            id="agentStateDot"
+            class="w-2 h-2 rounded-full bg-gray-300"
+            title="座席状态"
+          ></span>
+          <select
+            id="agentStateSelect"
+            title="切换座席状态"
+            class="text-xs text-gray-800 bg-white border border-white/40 rounded-lg pl-2 pr-6 py-1 focus:outline-none focus:ring-2 focus:ring-white/50 cursor-pointer"
+          ></select>
+        </div>
+        <!-- CCP 登录 / 退出 -->
+        <button
+          id="ccpAuthBtn"
+          onclick="ccpAuth()"
+          class="px-3 py-1.5 text-sm bg-white/20 text-white rounded-lg hover:bg-white/30 transition"
+        >
+          登录
+        </button>
         <button
           class="px-3 py-1.5 text-sm bg-white/20 text-white rounded-lg hover:bg-white/30 transition"
           id="logContainer-btn"
@@ -85,9 +155,7 @@
             </button>
           </div>
           <div id="unreadList" class="flex-1 overflow-auto p-3 space-y-2 min-h-0">
-            <div class="text-center text-gray-400 text-sm py-6">
-              请等待 CCP 登录完成后自动加载。
-            </div>
+            <div class="text-center text-gray-400 text-sm py-6">无</div>
           </div>
         </div>
 
@@ -176,9 +244,12 @@
             style="width: 420px"
           >
             <div
+              id="ccpDragHandle"
               class="px-3 py-2 border-b border-gray-200 bg-gray-50 flex items-center justify-between flex-shrink-0"
             >
-              <span class="text-sm font-semibold text-gray-700">CCP</span>
+              <span id="ccpTitle" class="text-sm font-semibold text-gray-700"
+                >CCP</span
+              >
               <button
                 onclick="hideCcp()"
                 class="px-2 py-1 text-sm text-gray-500 hover:text-gray-800"
